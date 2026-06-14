@@ -1,38 +1,185 @@
 // Package rickandmorty is the library behind the rickandmorty command line:
-// the HTTP client, request shaping, and the typed data models for rickandmorty.
+// the HTTP client, request shaping, and the typed data models for The Rick and
+// Morty API.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package rickandmorty
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"strconv"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to rickandmorty. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "rickandmorty/dev (+https://github.com/tamnd/rickandmorty-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at rickandmorty.com; change it once you
-// know the real endpoints you want to read.
-const Host = "rickandmorty.com"
+// Host is the site this client talks to.
+const Host = "rickandmortyapi.com"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to rickandmorty over HTTP.
+// DefaultUserAgent identifies the client to the API.
+const DefaultUserAgent = "rickandmorty-cli/0.1 (tamnd87@gmail.com)"
+
+// --- data models ---
+
+// Character is a single character record, flattened from the API response.
+type Character struct {
+	ID       int    `json:"id"       kit:"id"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Species  string `json:"species"`
+	Gender   string `json:"gender"`
+	Origin   string `json:"origin"`
+	Location string `json:"location"`
+	Episodes int    `json:"episodes"`
+}
+
+// Episode is a single episode record.
+type Episode struct {
+	ID        int    `json:"id"        kit:"id"`
+	Name      string `json:"name"`
+	AirDate   string `json:"air_date"`
+	Episode   string `json:"episode"`
+	CharCount int    `json:"char_count"`
+}
+
+// Location is a single location record.
+type Location struct {
+	ID        int    `json:"id"        kit:"id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Dimension string `json:"dimension"`
+	Residents int    `json:"residents"`
+}
+
+// --- raw API shapes ---
+
+type apiInfo struct {
+	Count int    `json:"count"`
+	Pages int    `json:"pages"`
+	Next  string `json:"next"`
+	Prev  string `json:"prev"`
+}
+
+type rawNameURL struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+type rawCharacter struct {
+	ID       int        `json:"id"`
+	Name     string     `json:"name"`
+	Status   string     `json:"status"`
+	Species  string     `json:"species"`
+	Type     string     `json:"type"`
+	Gender   string     `json:"gender"`
+	Origin   rawNameURL `json:"origin"`
+	Location rawNameURL `json:"location"`
+	Image    string     `json:"image"`
+	Episode  []string   `json:"episode"`
+	URL      string     `json:"url"`
+}
+
+func (r rawCharacter) toCharacter() *Character {
+	return &Character{
+		ID:       r.ID,
+		Name:     r.Name,
+		Status:   r.Status,
+		Species:  r.Species,
+		Gender:   r.Gender,
+		Origin:   r.Origin.Name,
+		Location: r.Location.Name,
+		Episodes: len(r.Episode),
+	}
+}
+
+type rawEpisode struct {
+	ID         int      `json:"id"`
+	Name       string   `json:"name"`
+	AirDate    string   `json:"air_date"`
+	Episode    string   `json:"episode"`
+	Characters []string `json:"characters"`
+	URL        string   `json:"url"`
+}
+
+func (r rawEpisode) toEpisode() *Episode {
+	return &Episode{
+		ID:        r.ID,
+		Name:      r.Name,
+		AirDate:   r.AirDate,
+		Episode:   r.Episode,
+		CharCount: len(r.Characters),
+	}
+}
+
+type rawLocation struct {
+	ID        int      `json:"id"`
+	Name      string   `json:"name"`
+	Type      string   `json:"type"`
+	Dimension string   `json:"dimension"`
+	Residents []string `json:"residents"`
+	URL       string   `json:"url"`
+}
+
+func (r rawLocation) toLocation() *Location {
+	return &Location{
+		ID:        r.ID,
+		Name:      r.Name,
+		Type:      r.Type,
+		Dimension: r.Dimension,
+		Residents: len(r.Residents),
+	}
+}
+
+type characterPage struct {
+	Info    apiInfo        `json:"info"`
+	Results []rawCharacter `json:"results"`
+}
+
+type episodePage struct {
+	Info    apiInfo      `json:"info"`
+	Results []rawEpisode `json:"results"`
+}
+
+type locationPage struct {
+	Info    apiInfo       `json:"info"`
+	Results []rawLocation `json:"results"`
+}
+
+// --- client ---
+
+// Config holds the tunable parameters for the client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
+}
+
+// DefaultConfig returns sensible defaults for talking to rickandmortyapi.com.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		Rate:      200 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
+		UserAgent: DefaultUserAgent,
+	}
+}
+
+// Client talks to The Rick and Morty API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +187,21 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Get fetches a URL and returns the response body. It paces and retries
+// according to the client's settings.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +211,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +220,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -123,78 +270,137 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on rickandmorty.com. It is a stand-in for the typed records you
-// will model from the real rickandmorty endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `rickandmorty cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- API methods ---
+
+// CharacterQuery holds the search parameters for the character list endpoint.
+type CharacterQuery struct {
+	Name    string
+	Status  string
+	Species string
+	Page    int
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// SearchCharacters searches the character list endpoint with the given query.
+func (c *Client) SearchCharacters(ctx context.Context, q CharacterQuery) ([]*Character, error) {
+	u := c.buildURL("/api/character", map[string]string{
+		"name":    q.Name,
+		"status":  q.Status,
+		"species": q.Species,
+		"page":    pageStr(q.Page),
+	})
+	body, err := c.Get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	var page characterPage
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, fmt.Errorf("parse characters: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	out := make([]*Character, 0, len(page.Results))
+	for _, r := range page.Results {
+		out = append(out, r.toCharacter())
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// GetCharacter fetches a single character by its integer ID.
+func (c *Client) GetCharacter(ctx context.Context, id int) (*Character, error) {
+	u := fmt.Sprintf("%s/api/character/%d", c.BaseURL, id)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
 	}
-	return out
+	var raw rawCharacter
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parse character: %w", err)
+	}
+	return raw.toCharacter(), nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// EpisodeQuery holds the search parameters for the episode list endpoint.
+type EpisodeQuery struct {
+	Name    string
+	Episode string
+	Page    int
+}
+
+// SearchEpisodes searches the episode list endpoint with the given query.
+func (c *Client) SearchEpisodes(ctx context.Context, q EpisodeQuery) ([]*Episode, error) {
+	u := c.buildURL("/api/episode", map[string]string{
+		"name":    q.Name,
+		"episode": q.Episode,
+		"page":    pageStr(q.Page),
+	})
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
 	}
-	return s
+	var page episodePage
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, fmt.Errorf("parse episodes: %w", err)
+	}
+	out := make([]*Episode, 0, len(page.Results))
+	for _, r := range page.Results {
+		out = append(out, r.toEpisode())
+	}
+	return out, nil
+}
+
+// LocationQuery holds the search parameters for the location list endpoint.
+type LocationQuery struct {
+	Name      string
+	Type      string
+	Dimension string
+	Page      int
+}
+
+// SearchLocations searches the location list endpoint with the given query.
+func (c *Client) SearchLocations(ctx context.Context, q LocationQuery) ([]*Location, error) {
+	u := c.buildURL("/api/location", map[string]string{
+		"name":      q.Name,
+		"type":      q.Type,
+		"dimension": q.Dimension,
+		"page":      pageStr(q.Page),
+	})
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var page locationPage
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, fmt.Errorf("parse locations: %w", err)
+	}
+	out := make([]*Location, 0, len(page.Results))
+	for _, r := range page.Results {
+		out = append(out, r.toLocation())
+	}
+	return out, nil
+}
+
+// buildURL assembles a full URL from a path and a map of query parameters,
+// omitting any parameters with empty values.
+func (c *Client) buildURL(path string, params map[string]string) string {
+	base := c.BaseURL
+	if base == "" {
+		base = BaseURL
+	}
+	v := url.Values{}
+	for k, val := range params {
+		if val != "" {
+			v.Set(k, val)
+		}
+	}
+	if len(v) == 0 {
+		return base + path
+	}
+	return base + path + "?" + v.Encode()
+}
+
+// pageStr converts a page number to a string, returning an empty string for
+// zero or negative values so the parameter is omitted (the API defaults to 1).
+func pageStr(page int) string {
+	if page <= 0 {
+		return ""
+	}
+	return strconv.Itoa(page)
 }
