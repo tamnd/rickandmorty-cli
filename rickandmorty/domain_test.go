@@ -7,8 +7,8 @@ import (
 )
 
 // These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in rickandmorty_test.go.
+// and the host wiring (mint, body, resolve), which need no network. The
+// client's HTTP behaviour is covered in rickandmorty_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,53 +24,76 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in  string
+		typ string
+		id  string
+		ok  bool
+	}{
+		{"1", "character", "1", true},
+		{"42", "character", "42", true},
+		{"abc", "", "", false},
+		{"", "", "", false},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+		if tc.ok {
+			if err != nil || typ != tc.typ || id != tc.id {
+				t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
+					tc.in, typ, id, err, tc.typ, tc.id)
+			}
+		} else {
+			if err == nil {
+				t.Errorf("Classify(%q) expected error, got (%q, %q, nil)", tc.in, typ, id)
+			}
 		}
 	}
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+	cases := []struct {
+		uriType string
+		id      string
+		want    string
+	}{
+		{"character", "1", BaseURL + "/api/character/1"},
+		{"episode", "5", BaseURL + "/api/episode/5"},
+		{"location", "3", BaseURL + "/api/location/3"},
+	}
+	for _, tc := range cases {
+		got, err := Domain{}.Locate(tc.uriType, tc.id)
+		if err != nil || got != tc.want {
+			t.Errorf("Locate(%q, %q) = (%q, %v), want (%q, nil)",
+				tc.uriType, tc.id, got, err, tc.want)
+		}
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("bogus", "1")
+	if err == nil {
+		t.Error("Locate with unknown type should return an error")
+	}
+}
+
+// TestHostWiring mounts the driver in a kit Host and checks the round trip.
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+	ch := &Character{ID: 1, Name: "Rick Sanchez", Status: "Alive", Species: "Human"}
+	u, err := h.Mint(ch)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "rickandmorty://page/wiki/Go"; u.String() != want {
+	if want := "rickandmorty://character/1"; u.String() != want {
 		t.Errorf("Mint = %q, want %q", u.String(), want)
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("rickandmorty", "about")
-	if err != nil || got.String() != "rickandmorty://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want rickandmorty://page/about", got.String(), err)
+	got, err := h.ResolveOn("rickandmorty", "7")
+	if err != nil || got.String() != "rickandmorty://character/7" {
+		t.Errorf("ResolveOn = (%q, %v), want rickandmorty://character/7", got.String(), err)
 	}
 }
